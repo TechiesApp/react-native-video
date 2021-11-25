@@ -6,7 +6,6 @@ import android.content.Context;
 import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Handler;
-import android.os.Looper;
 import android.os.Message;
 import android.text.TextUtils;
 import android.util.Log;
@@ -31,9 +30,8 @@ import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.DefaultLoadControl;
 import com.google.android.exoplayer2.DefaultRenderersFactory;
 import com.google.android.exoplayer2.ExoPlaybackException;
+import com.google.android.exoplayer2.ExoPlayerFactory;
 import com.google.android.exoplayer2.Format;
-import com.google.android.exoplayer2.MediaItem;
-import com.google.android.exoplayer2.PlaybackException;
 import com.google.android.exoplayer2.PlaybackParameters;
 import com.google.android.exoplayer2.Player;
 import com.google.android.exoplayer2.SimpleExoPlayer;
@@ -41,13 +39,14 @@ import com.google.android.exoplayer2.Timeline;
 import com.google.android.exoplayer2.drm.DefaultDrmSessionManager;
 import com.google.android.exoplayer2.drm.DrmSessionEventListener;
 import com.google.android.exoplayer2.drm.DrmSessionManager;
-import com.google.android.exoplayer2.drm.ExoMediaDrm;
+import com.google.android.exoplayer2.drm.FrameworkMediaCrypto;
 import com.google.android.exoplayer2.drm.FrameworkMediaDrm;
 import com.google.android.exoplayer2.drm.HttpMediaDrmCallback;
 import com.google.android.exoplayer2.drm.UnsupportedDrmException;
 import com.google.android.exoplayer2.mediacodec.MediaCodecRenderer;
 import com.google.android.exoplayer2.mediacodec.MediaCodecUtil;
 import com.google.android.exoplayer2.metadata.Metadata;
+import com.google.android.exoplayer2.metadata.MetadataOutput;
 import com.google.android.exoplayer2.source.BehindLiveWindowException;
 import com.google.android.exoplayer2.source.MediaSource;
 import com.google.android.exoplayer2.source.MergingMediaSource;
@@ -84,10 +83,11 @@ import java.util.Map;
 @SuppressLint("ViewConstructor")
 class ReactExoplayerView extends FrameLayout implements
         LifecycleEventListener,
-        Player.Listener,
+        Player.EventListener,
         BandwidthMeter.EventListener,
         BecomingNoisyListener,
         AudioManager.OnAudioFocusChangeListener,
+        MetadataOutput,
         DrmSessionEventListener {
 
     private static final String TAG = "ReactExoplayerView";
@@ -105,7 +105,7 @@ class ReactExoplayerView extends FrameLayout implements
     private final DefaultBandwidthMeter bandwidthMeter;
     private PlayerControlView playerControlView;
     private View playPauseControlContainer;
-    private Player.Listener eventListener;
+    private Player.EventListener eventListener;
 
     private ExoPlayerView exoPlayerView;
 
@@ -127,6 +127,7 @@ class ReactExoplayerView extends FrameLayout implements
     private float audioVolume = 1f;
     private int minLoadRetryCount = 3;
     private int maxBitRate = 0;
+    private long seekTime = C.TIME_UNSET;
 
     private int minBufferMs = DefaultLoadControl.DEFAULT_MIN_BUFFER_MS;
     private int maxBufferMs = DefaultLoadControl.DEFAULT_MAX_BUFFER_MS;
@@ -163,7 +164,7 @@ class ReactExoplayerView extends FrameLayout implements
     private final AudioManager audioManager;
     private final AudioBecomingNoisyReceiver audioBecomingNoisyReceiver;
 
-    private final Handler progressHandler = new Handler(Looper.getMainLooper()) {
+    private final Handler progressHandler = new Handler() {
         @Override
         public void handleMessage(Message msg) {
             switch (msg.what) {
@@ -347,9 +348,9 @@ class ReactExoplayerView extends FrameLayout implements
         });
 
         // Invoking onPlayerStateChanged event for Player
-        eventListener = new Player.Listener() {
+        eventListener = new Player.EventListener() {
             @Override
-            public void onPlaybackStateChanged(int playbackState) {
+            public void onPlayerStateChanged(boolean playWhenReady, int playbackState) {
                 reLayout(playPauseControlContainer);
                 //Remove this eventListener once its executed. since UI will work fine once after the reLayout is done
                 player.removeListener(eventListener);
@@ -395,7 +396,7 @@ class ReactExoplayerView extends FrameLayout implements
             public void run() {
                 if (player == null) {
                     ExoTrackSelection.Factory videoTrackSelectionFactory = new AdaptiveTrackSelection.Factory();
-                    trackSelector = new DefaultTrackSelector(getContext(), videoTrackSelectionFactory);
+                    trackSelector = new DefaultTrackSelector(videoTrackSelectionFactory);
                     trackSelector.setParameters(trackSelector.buildUponParameters()
                             .setMaxVideoBitrate(maxBitRate == 0 ? Integer.MAX_VALUE : maxBitRate));
 
@@ -405,7 +406,7 @@ class ReactExoplayerView extends FrameLayout implements
                     defaultLoadControlBuilder.setBufferDurationsMs(minBufferMs, maxBufferMs, bufferForPlaybackMs, bufferForPlaybackAfterRebufferMs);
                     defaultLoadControlBuilder.setTargetBufferBytes(-1);
                     defaultLoadControlBuilder.setPrioritizeTimeOverSizeThresholds(true);
-                                        DefaultLoadControl defaultLoadControl = defaultLoadControlBuilder.build();
+                    DefaultLoadControl defaultLoadControl = defaultLoadControlBuilder.createDefaultLoadControl();
                     DefaultRenderersFactory renderersFactory =
                             new DefaultRenderersFactory(getContext())
                                     .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF);
@@ -415,6 +416,7 @@ class ReactExoplayerView extends FrameLayout implements
                                 .setLoadControl(defaultLoadControl)
                                 .build();
                     player.addListener(self);
+                    player.addMetadataOutput(self);
                     exoPlayerView.setPlayer(player);
                     audioBecomingNoisyReceiver.setListener(self);
                     bandwidthMeter.addEventListener(new Handler(), self);
@@ -460,8 +462,7 @@ class ReactExoplayerView extends FrameLayout implements
                     if (haveResumePosition) {
                         player.seekTo(resumeWindow, resumePosition);
                     }
-                    player.setMediaSource(mediaSource, !haveResumePosition);
-                    player.prepare();
+                    player.prepare(mediaSource, !haveResumePosition, false);
                     playerNeedsSource = false;
 
                     reLayout(exoPlayerView);
@@ -490,17 +491,13 @@ class ReactExoplayerView extends FrameLayout implements
                         keyRequestPropertiesArray[i + 1]);
             }
         }
-        return new DefaultDrmSessionManager.Builder()
-                .setUuidAndExoMediaDrmProvider(uuid, new ExoMediaDrm.AppManagedProvider(FrameworkMediaDrm.newInstance(uuid)))
-                .setKeyRequestParameters(null)
-                .setMultiSession(false)
-                .build(drmCallback);
+        return new DefaultDrmSessionManager(uuid,
+                FrameworkMediaDrm.newInstance(uuid), drmCallback, null, false, 3);
     }
 
     private MediaSource buildMediaSource(Uri uri, String overrideExtension, DrmSessionManager drmSessionManager) {
         int type = Util.inferContentType(!TextUtils.isEmpty(overrideExtension) ? "." + overrideExtension
                 : uri.getLastPathSegment());
-                MediaItem mediaItem = new MediaItem.Builder().setUri(uri).build();
         switch (type) {
             case C.TYPE_SS:
                 return new SsMediaSource.Factory(
@@ -509,7 +506,7 @@ class ReactExoplayerView extends FrameLayout implements
                 ).setDrmSessionManager(drmSessionManager)
                  .setLoadErrorHandlingPolicy(
                         config.buildLoadErrorHandlingPolicy(minLoadRetryCount)
-                ).createMediaSource(mediaItem);
+                ).createMediaSource(uri);
             case C.TYPE_DASH:
                 return new DashMediaSource.Factory(
                         new DefaultDashChunkSource.Factory(mediaDataSourceFactory),
@@ -517,21 +514,21 @@ class ReactExoplayerView extends FrameLayout implements
                 ).setDrmSessionManager(drmSessionManager)
                  .setLoadErrorHandlingPolicy(
                         config.buildLoadErrorHandlingPolicy(minLoadRetryCount)
-                ).createMediaSource(mediaItem);
+                ).createMediaSource(uri);
             case C.TYPE_HLS:
                 return new HlsMediaSource.Factory(
                         mediaDataSourceFactory
                 ).setDrmSessionManager(drmSessionManager)
                  .setLoadErrorHandlingPolicy(
                         config.buildLoadErrorHandlingPolicy(minLoadRetryCount)
-                ).createMediaSource(mediaItem);
+                ).createMediaSource(uri);
             case C.TYPE_OTHER:
                 return new ProgressiveMediaSource.Factory(
                         mediaDataSourceFactory
                 ).setDrmSessionManager(drmSessionManager)
                  .setLoadErrorHandlingPolicy(
                         config.buildLoadErrorHandlingPolicy(minLoadRetryCount)
-                ).createMediaSource(mediaItem);
+                ).createMediaSource(uri);
             default: {
                 throw new IllegalStateException("Unsupported type: " + type);
             }
@@ -560,16 +557,16 @@ class ReactExoplayerView extends FrameLayout implements
     }
 
     private MediaSource buildTextSource(String title, Uri uri, String mimeType, String language) {
-            MediaItem.Subtitle subtitle = new MediaItem.Subtitle(uri, mimeType, language, C.SELECTION_FLAG_DEFAULT, C.ROLE_FLAG_SUBTITLE, title);
+        Format textFormat = Format.createTextSampleFormat(title, mimeType, Format.NO_VALUE, language);
         return new SingleSampleMediaSource.Factory(mediaDataSourceFactory)
-                .createMediaSource(subtitle, C.TIME_UNSET);
+                .createMediaSource(uri, textFormat, C.TIME_UNSET);
     }
 
     private void releasePlayer() {
         if (player != null) {
             updateResumePosition();
             player.release();
-            player.removeListener(this);
+            player.removeMetadataOutput(this);
             trackSelector = null;
             player = null;
         }
@@ -729,57 +726,52 @@ class ReactExoplayerView extends FrameLayout implements
         eventEmitter.audioBecomingNoisy();
     }
 
-    // Player.Listener implementation
+    // Player.EventListener implementation
 
     @Override
-    public void onIsLoadingChanged(boolean isLoading) {
+    public void onLoadingChanged(boolean isLoading) {
         // Do nothing.
     }
 
     @Override
-   public void onEvents(Player player, Player.Events events) {
-        if (events.contains(Player.EVENT_PLAYBACK_STATE_CHANGED) || events.contains(Player.EVENT_PLAY_WHEN_READY_CHANGED)) {
-            int playbackState = player.getPlaybackState();
-            boolean playWhenReady = player.getPlayWhenReady();
-            String text = "onStateChanged: playWhenReady=" + playWhenReady + ", playbackState=";
-            switch (playbackState) {
-                case Player.STATE_IDLE:
-                    text += "idle";
-                    eventEmitter.idle();
-                    clearProgressMessageHandler();
-                    if (!player.getPlayWhenReady()) {
-                        setKeepScreenOn(false);
-                    }
-                    break;
-                case Player.STATE_BUFFERING:
-                    text += "buffering";
-                    onBuffering(true);
-                    clearProgressMessageHandler();
-                    setKeepScreenOn(preventsDisplaySleepDuringVideoPlayback);
-                    break;
-                case Player.STATE_READY:
-                    text += "ready";
-                    eventEmitter.ready();
-                    onBuffering(false);
-                    startProgressHandler();
-                    videoLoaded();
-                    // Setting the visibility for the playerControlView
-                    if (playerControlView != null) {
-                        playerControlView.show();
-                    }
-                    setKeepScreenOn(preventsDisplaySleepDuringVideoPlayback);
-                    break;
-                case Player.STATE_ENDED:
-                    text += "ended";
-                    eventEmitter.end();
-                    onStopPlayback();
+    public void onPlayerStateChanged(boolean playWhenReady, int playbackState) {
+        String text = "onStateChanged: playWhenReady=" + playWhenReady + ", playbackState=";
+        switch (playbackState) {
+            case Player.STATE_IDLE:
+                text += "idle";
+                eventEmitter.idle();
+                clearProgressMessageHandler();
+                if (!playWhenReady) {
                     setKeepScreenOn(false);
-               break;
-                default:
-                    text += "unknown";
-                    break;
-            }
-            Log.d(TAG, text);
+                }
+                break;
+            case Player.STATE_BUFFERING:
+                text += "buffering";
+                onBuffering(true);
+                clearProgressMessageHandler();
+                setKeepScreenOn(preventsDisplaySleepDuringVideoPlayback);
+                break;
+            case Player.STATE_READY:
+                text += "ready";
+                eventEmitter.ready();
+                onBuffering(false);
+                startProgressHandler();
+                videoLoaded();
+                // Setting the visibility for the playerControlView
+                if (playerControlView != null) {
+                    playerControlView.show();
+                }
+                setKeepScreenOn(preventsDisplaySleepDuringVideoPlayback);
+                break;
+            case Player.STATE_ENDED:
+                text += "ended";
+                eventEmitter.end();
+                onStopPlayback();
+                setKeepScreenOn(false);
+                break;
+            default:
+                text += "unknown";
+                break;
         }
         Log.d(TAG, text);
     }
@@ -899,7 +891,7 @@ class ReactExoplayerView extends FrameLayout implements
     }
 
     @Override
-        public void onPositionDiscontinuity(Player.PositionInfo oldPosition, Player.PositionInfo newPosition, int reason) {
+    public void onPositionDiscontinuity(int reason) {
         if (playerNeedsSource) {
             // This will only occur if the user has performed a seek whilst in the error state. Update the
             // resume position so that if the user then retries, playback will resume from the position to
@@ -908,16 +900,21 @@ class ReactExoplayerView extends FrameLayout implements
         }
         // When repeat is turned on, reaching the end of the video will not cause a state change
         // so we need to explicitly detect it.
-        if (reason == Player.DISCONTINUITY_REASON_AUTO_TRANSITION
+        if (reason == Player.DISCONTINUITY_REASON_PERIOD_TRANSITION
                 && player.getRepeatMode() == Player.REPEAT_MODE_ONE) {
             eventEmitter.end();
         }
     }
 
+    @Override
+    public void onTimelineChanged(Timeline timeline, Object manifest, int reason) {
+        // Do nothing.
+    }
 
     @Override
-   public void onTimelineChanged(Timeline timeline, int reason) {
-        // Do nothing.
+    public void onSeekProcessed() {
+        eventEmitter.seek(player.getCurrentPosition(), seekTime);
+        seekTime = C.TIME_UNSET;
     }
 
     @Override
@@ -941,12 +938,9 @@ class ReactExoplayerView extends FrameLayout implements
     }
 
     @Override
-    public void onPlayerError(PlaybackException error) {
-        if (!(error instanceof ExoPlaybackException)) {
-            return;
-        }
-        ExoPlaybackException e = (ExoPlaybackException)error;
+    public void onPlayerError(ExoPlaybackException e) {
         String errorString = "ExoPlaybackException type : " + e.type;
+        Exception ex = e;
         if (e.type == ExoPlaybackException.TYPE_RENDERER) {
             Exception cause = e.getRendererException();
             if (cause instanceof MediaCodecRenderer.DecoderInitializationException) {
@@ -972,7 +966,7 @@ class ReactExoplayerView extends FrameLayout implements
         else if (e.type == ExoPlaybackException.TYPE_SOURCE) {
             errorString = getResources().getString(R.string.unrecognized_media_format);
         }
-        eventEmitter.error(errorString, e);
+        eventEmitter.error(errorString, ex);
         playerNeedsSource = true;
         if (isBehindLiveWindow(e)) {
             clearResumePosition();
@@ -1262,8 +1256,8 @@ class ReactExoplayerView extends FrameLayout implements
 
     public void seekTo(long positionMs) {
         if (player != null) {
+            seekTime = positionMs;
             player.seekTo(positionMs);
-            eventEmitter.seek(player.getCurrentPosition(), positionMs);
         }
     }
 
